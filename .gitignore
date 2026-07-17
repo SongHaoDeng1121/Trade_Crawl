@@ -1,0 +1,32 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Local business data and exports
+/data/
+/transfer/
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.backup-*
+*.csv.bak
+*.log
+*.tar
+*.tar.gz
+*.zip
+
+# Python and operating-system files
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.DS_Store
+
+# Tool/editor state
+.vscode/
+.idea/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

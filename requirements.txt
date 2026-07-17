@@ -1,0 +1,2 @@
+# This project currently uses only the Python standard library.
+# Keep this file so bootstrap scripts have a stable place to install future packages.

@@ -1,0 +1,3 @@
+industrial equipment distributor {country}
+industrial supplies importer {country}
+B2B product wholesaler {country}

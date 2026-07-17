@@ -1,0 +1,57 @@
+{
+  "name": "Europe Steel Pipe Outreach MVP",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "manual-trigger",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "command": "cd \"$HOME/Documents/Trade crawl\" && python3 -m trade_outreach.cli init-db && python3 -m trade_outreach.cli import-leads-csv data/google_maps_export.csv --source google-maps"
+      },
+      "id": "init-import",
+      "name": "Init and Import Europe CSV",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [480, 300]
+    },
+    {
+      "parameters": {
+        "command": "cd \"$HOME/Documents/Trade crawl\" && python3 -m trade_outreach.cli scrape --limit 200"
+      },
+      "id": "scrape",
+      "name": "Scrape Websites",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [720, 300]
+    },
+    {
+      "parameters": {
+        "command": "cd \"$HOME/Documents/Trade crawl\" && python3 -m trade_outreach.cli score && python3 -m trade_outreach.cli draft --limit 100 && python3 -m trade_outreach.cli export-csv data/drafts.csv && python3 -m trade_outreach.cli stats"
+      },
+      "id": "score-draft-export",
+      "name": "Score Draft Export",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [960, 300]
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [[{"node": "Init and Import Europe CSV", "type": "main", "index": 0}]]
+    },
+    "Init and Import Europe CSV": {
+      "main": [[{"node": "Scrape Websites", "type": "main", "index": 0}]]
+    },
+    "Scrape Websites": {
+      "main": [[{"node": "Score Draft Export", "type": "main", "index": 0}]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
