@@ -1,5 +1,7 @@
 # Steel Pipe Distributor Outreach MVP
 
+[English](README_EN.md) | 简体中文
+
 这是一个本地优先的 B2B 线索抓取、评分、邮件草稿和受控发信系统，适合和 n8n 搭配使用。
 
 默认流程是：
