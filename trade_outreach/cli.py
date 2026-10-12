@@ -5,18 +5,30 @@ import csv
 import json
 import re
 import smtplib
+import sqlite3
 import sys
+import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
+from email.utils import getaddresses
 from pathlib import Path
 
 from .config import get_settings
 from .db import connect, init_db, normalize_url, upsert_leads
 from .discovery import discover_websites
+from .discovery_schedule import (
+    country_discovery_status,
+    plan_country_schedule,
+    record_cooldown_skips,
+    record_country_round,
+    record_discovery_run,
+    scheduled_queries,
+)
 from .emailer import send_email, test_smtp
 from .llm import cache_key, generate_text, personalization_prompt
 from .scoring import clean_emails_for_website, is_generic_business_email, is_valid_business_email, pick_recipient, score_lead
+from .send_control import acquire_send_slot, global_sent_state
 from .scraper import scrape_site
 from .templates import draft_body, subject_for
 
@@ -79,6 +91,208 @@ def has_sendable_drafts(status: dict[str, int], auto_approve: bool) -> bool:
     return status["valid_approved_unsent"] > 0 or (auto_approve and status["valid_pending_unsent"] > 0)
 
 
+def approved_send_backlog(db_path: str) -> int:
+    conn = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True, timeout=10)
+    try:
+        return int(conn.execute(
+            "SELECT COUNT(*) FROM email_drafts WHERE approved = 1 AND sent_at IS NULL"
+        ).fetchone()[0])
+    finally:
+        conn.close()
+
+
+def recipient_needs_smtputf8(recipient: str, settings) -> bool:
+    envelope_addresses = getaddresses([settings.mail_from, settings.mail_cc, settings.mail_bcc])
+    return not recipient.isascii() and all(address.isascii() for _, address in envelope_addresses)
+
+
+def run_queue_worker(
+    name: str,
+    action,
+    cycles: int,
+    interval_seconds: float,
+    stop_event: threading.Event,
+    failures: list[str],
+) -> None:
+    cycle = 0
+    while not stop_event.is_set():
+        cycle += 1
+        print(f"\n--- {name} queue cycle {cycle} ---", flush=True)
+        try:
+            returncode = action()
+            if returncode:
+                message = f"{name} queue cycle {cycle} returned exit code {returncode}."
+                failures.append(message)
+                print(message, flush=True)
+        except Exception as exc:
+            message = f"{name} queue cycle {cycle} failed: {type(exc).__name__}: {exc}"
+            failures.append(message)
+            print(message, flush=True)
+
+        if cycles and cycle >= cycles:
+            break
+        if interval_seconds > 0:
+            print(f"{name} queue sleeping {interval_seconds:g}s before its next cycle.", flush=True)
+            stop_event.wait(interval_seconds)
+
+
+def run_independent_auto_pipeline(args, settings) -> int:
+    auto_approve = not args.no_auto_approve
+    send_real = not args.dry_run
+    discovery_interval = (
+        settings.auto_discovery_interval_seconds
+        if args.discovery_interval_seconds is None
+        else args.discovery_interval_seconds
+    )
+    processing_interval = (
+        settings.auto_processing_interval_seconds
+        if args.processing_interval_seconds is None
+        else args.processing_interval_seconds
+    )
+    send_idle = settings.auto_send_idle_seconds if args.idle_sleep_seconds is None else args.idle_sleep_seconds
+
+    print("Auto pipeline started with independent discovery, processing, and sending queues.", flush=True)
+    print(
+        f"Queue intervals: discovery={discovery_interval:g}s, "
+        f"processing={processing_interval:g}s, send-idle={send_idle:g}s.",
+        flush=True,
+    )
+    print(
+        "Real sending is ENABLED." if send_real else "Real sending is disabled because --dry-run was provided.",
+        flush=True,
+    )
+    print(
+        "Auto approval is ENABLED." if auto_approve else "Auto approval is disabled because --no-auto-approve was provided.",
+        flush=True,
+    )
+
+    def backlog_is_full() -> bool:
+        threshold = args.backlog_pause_threshold
+        if threshold <= 0:
+            return False
+        count = approved_send_backlog(settings.db_path)
+        if count >= threshold:
+            print(
+                f"Approved send backlog is {count} (pause threshold {threshold}); "
+                "pausing discovery and processing while sending continues.",
+                flush=True,
+            )
+            return True
+        return False
+
+    def discovery_cycle() -> int:
+        if backlog_is_full():
+            return 0
+        discover_args = [
+            "discover-batch",
+            "--queries-file",
+            args.queries_file,
+            "--countries-file",
+            args.countries_file,
+            "--count",
+            str(args.discover_count),
+            "--limit-queries",
+            str(args.limit_queries),
+            "--limit-countries",
+            str(args.limit_countries),
+            "--execute",
+        ]
+        if args.least_searched_countries:
+            discover_args.extend(["--least-searched-countries", str(args.least_searched_countries)])
+        if args.scheduled_countries:
+            discover_args.extend(["--scheduled-countries", str(args.scheduled_countries)])
+        return run_cli_step("discover companies", discover_args)
+
+    def processing_cycle() -> int:
+        if backlog_is_full():
+            return 0
+        scrape_args = [
+            "scrape",
+            "--limit",
+            str(args.scrape_limit),
+            "--retry-failed",
+            "--max-seconds",
+            str(args.scrape_max_seconds),
+            "--fetch-attempts",
+            str(args.fetch_attempts),
+            "--fetch-timeout",
+            str(args.fetch_timeout),
+            "--site-max-seconds",
+            str(args.site_max_seconds),
+            "--workers",
+            str(args.scrape_workers),
+        ]
+        returncode = run_cli_step("scrape emails", scrape_args)
+        if returncode:
+            return returncode
+        returncode = run_cli_step("score leads", ["score"])
+        if returncode:
+            return returncode
+        draft_args = ["draft", "--limit", str(args.draft_limit), "--min-score", str(args.draft_min_score)]
+        if args.include_personal:
+            draft_args.append("--include-personal")
+        if args.no_cache:
+            draft_args.append("--no-cache")
+        returncode = run_cli_step("generate drafts", draft_args)
+        if returncode or not auto_approve:
+            if not auto_approve:
+                print("Drafts remain pending because --no-auto-approve was provided.", flush=True)
+            return returncode
+        approve_args = [
+            "approve-batch",
+            "--limit",
+            str(args.approve_limit),
+            "--min-score",
+            str(args.approve_min_score),
+            "--execute",
+        ]
+        if args.include_personal:
+            approve_args.append("--include-personal")
+        return run_cli_step("approve drafts", approve_args)
+
+    def sending_cycle() -> int:
+        send_args = ["send", "--limit", str(args.send_limit), "--continue-after-sleep"]
+        if args.delay_seconds is not None:
+            send_args.extend(["--delay-seconds", str(args.delay_seconds)])
+        if not send_real:
+            send_args.append("--dry-run")
+        return run_cli_step("send approved drafts", send_args)
+
+    stop_event = threading.Event()
+    failures: list[str] = []
+    queue_specs = []
+    if not args.skip_discovery:
+        queue_specs.append(("Discovery", discovery_cycle, discovery_interval))
+    queue_specs.extend(
+        [
+            ("Processing", processing_cycle, processing_interval),
+            ("Sending", sending_cycle, send_idle),
+        ]
+    )
+    threads = [
+        threading.Thread(
+            target=run_queue_worker,
+            args=(name, action, args.cycles, interval, stop_event, failures),
+            name=f"auto-{name.lower()}",
+            daemon=True,
+        )
+        for name, action, interval in queue_specs
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        while any(thread.is_alive() for thread in threads):
+            for thread in threads:
+                thread.join(timeout=0.5)
+    except KeyboardInterrupt:
+        print("Stopping all Auto Pipeline queues...", flush=True)
+        stop_event.set()
+        for thread in threads:
+            thread.join(timeout=5)
+    print(f"Auto pipeline finished. Queue errors recorded: {len(failures)}.", flush=True)
+    return 1 if args.cycles and failures else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Steel pipe distributor outreach pipeline")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -111,7 +325,11 @@ def main(argv: list[str] | None = None) -> int:
     p_discover_europe.add_argument("--offset-queries", type=int, default=0)
     p_discover_europe.add_argument("--offset-countries", type=int, default=0)
     p_discover_europe.add_argument("--least-searched-countries", type=int, default=0)
+    p_discover_europe.add_argument("--scheduled-countries", type=int, default=0)
     p_discover_europe.add_argument("--execute", action="store_true")
+
+    p_discovery_status = sub.add_parser("discovery-status")
+    p_discovery_status.add_argument("--countries-file", default="examples/countries.txt")
 
     p_scrape = sub.add_parser("scrape")
     p_scrape.add_argument("--limit", type=int, default=25)
@@ -213,7 +431,8 @@ def main(argv: list[str] | None = None) -> int:
     p_auto.add_argument("--discover-count", type=int, default=10)
     p_auto.add_argument("--limit-queries", type=int, default=1)
     p_auto.add_argument("--limit-countries", type=int, default=1)
-    p_auto.add_argument("--least-searched-countries", type=int, default=3)
+    p_auto.add_argument("--least-searched-countries", type=int, default=0)
+    p_auto.add_argument("--scheduled-countries", type=int, default=3)
     p_auto.add_argument("--skip-discovery", action="store_true")
     p_auto.add_argument("--scrape-limit", type=int, default=100)
     p_auto.add_argument("--scrape-workers", type=int, default=4)
@@ -229,11 +448,17 @@ def main(argv: list[str] | None = None) -> int:
     p_auto.add_argument("--approve-limit", type=int, default=100)
     p_auto.add_argument("--approve-min-score", type=int, default=0)
     p_auto.add_argument("--send-limit", type=int, default=5)
+    p_auto.add_argument(
+        "--backlog-pause-threshold", type=int, default=100,
+        help="Pause discovery and processing when this many approved unsent drafts exist; 0 disables pausing.",
+    )
     p_auto.add_argument("--delay-seconds", type=float)
     p_auto.add_argument("--dry-run", action="store_true")
     p_auto.add_argument("--cycles", type=int, default=1, help="Number of cycles to run; 0 means run forever.")
     p_auto.add_argument("--sleep-seconds", type=float, default=0)
-    p_auto.add_argument("--idle-sleep-seconds", type=float, default=300)
+    p_auto.add_argument("--idle-sleep-seconds", type=float)
+    p_auto.add_argument("--discovery-interval-seconds", type=float)
+    p_auto.add_argument("--processing-interval-seconds", type=float)
 
     args = parser.parse_args(argv)
     settings = get_settings()
@@ -244,7 +469,24 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Initialized {settings.db_path}")
         return 0
 
+    if args.cmd == "discovery-status":
+        countries = read_list_file(args.countries_file)
+        status = country_discovery_status(conn, settings, countries)
+        for country in countries:
+            item = status[country]
+            cooldown = f" cooling_until={item['cooldown_until']}" if item["cooldown_active"] else ""
+            print(
+                f"{country}: leads={item['lead_count']}/{item['target_count']} tier={item['tier']} "
+                f"round={item['rounds_completed']} no_new={item['no_new_rounds']} "
+                f"last={item['last_searched_at'] or '-'}{cooldown}"
+            )
+        return 0
+
     if args.cmd == "auto-pipeline":
+        conn.close()
+        return run_independent_auto_pipeline(args, settings)
+
+    if args.cmd == "__legacy-auto-pipeline":
         auto_approve = not args.no_auto_approve
         send_real = not args.dry_run
         print("Auto pipeline started.")
@@ -319,6 +561,8 @@ def main(argv: list[str] | None = None) -> int:
                         ]
                         if args.least_searched_countries:
                             discover_args.extend(["--least-searched-countries", str(args.least_searched_countries)])
+                        if args.scheduled_countries:
+                            discover_args.extend(["--scheduled-countries", str(args.scheduled_countries)])
                         rc = run_cli_step("discover companies", discover_args)
                         if rc:
                             return rc
@@ -453,6 +697,12 @@ def main(argv: list[str] | None = None) -> int:
             queries = [(query, "") for query in args.query]
         all_rows: list[dict] = []
         failed_queries = []
+        known_websites = {
+            normalize_url(row["website"])
+            for row in conn.execute("SELECT website FROM leads")
+            if normalize_url(row["website"])
+        }
+        run_records = []
         for query, country in queries:
             print(f"Searching: {query}")
             try:
@@ -460,11 +710,17 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as exc:
                 failed_queries.append((query, str(exc)))
                 print(f"  failed: {exc}")
+                run_records.append((query, country, 0, 0, 0, str(exc)))
                 continue
             if country:
                 for row in rows:
                     row["country"] = country
             all_rows.extend(rows)
+            websites = {normalize_url(row.get("website", "")) for row in rows}
+            websites.discard("")
+            new_websites = websites - known_websites
+            known_websites.update(websites)
+            run_records.append((query, country, len(rows), len(websites), len(new_websites), ""))
             for row in rows:
                 print(f"  {row['company_name']} -> {row['website']}")
         unique_rows = dedupe_rows(all_rows)
@@ -477,6 +733,19 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Preview only: {len(unique_rows)} unique websites. Re-run with --execute to import.")
             return 0
         result = import_discovered_rows(conn, unique_rows)
+        for query, country, result_count, unique_count, new_count, error in run_records:
+            record_discovery_run(
+                conn,
+                country=country,
+                query=query,
+                base_query=query,
+                phase="manual",
+                result_count=result_count,
+                unique_count=unique_count,
+                new_count=new_count,
+                error=error,
+            )
+        conn.commit()
         print(
             f"Imported {result['processed']} discovered websites "
             f"({result['created']} new, {result['updated']} existing)"
@@ -490,34 +759,116 @@ def main(argv: list[str] | None = None) -> int:
             query_specs = query_specs[max(args.offset_queries, 0) :]
         if args.offset_countries:
             countries = countries[max(args.offset_countries, 0) :]
-        if args.least_searched_countries:
-            countries = least_searched_countries(conn, countries, args.least_searched_countries)
-        if args.limit_countries is not None:
-            countries = countries[: args.limit_countries]
-        if args.limit_queries is not None:
-            query_specs = limit_query_specs_for_countries(query_specs, countries, args.limit_queries)
-        print(
-            f"Discovery plan: {len(query_specs)} query pattern(s), {len(countries)} country/countries."
-        )
-        if args.least_searched_countries and countries:
-            print("Least-covered countries selected: " + ", ".join(countries))
-        queries = build_country_queries(query_specs, countries)
+        schedule_plan = None
+        scheduled_by_country = {}
+        if args.scheduled_countries:
+            schedule_plan = plan_country_schedule(
+                conn,
+                settings,
+                countries,
+                args.scheduled_countries,
+                args.limit_queries if args.limit_queries is not None else 3,
+            )
+            scheduled_by_country = {item.country: item for item in schedule_plan.countries}
+            countries = [item.country for item in schedule_plan.countries]
+            query_jobs = [
+                row
+                for item in schedule_plan.countries
+                for row in scheduled_queries(conn, query_specs, item, settings)
+            ]
+            print(f"Fair discovery schedule: {len(countries)} country/countries, {len(query_jobs)} new query/query combinations.")
+            for item in schedule_plan.countries:
+                print(
+                    f"  - {item.country}: round {item.round_no} {item.phase}, "
+                    f"leads {item.lead_count}/{item.target_count}, query limit {item.query_limit}"
+                )
+            if schedule_plan.cooldown_skips:
+                print(
+                    "Cooldown skips this round: "
+                    + ", ".join(country for country, _, _, _ in schedule_plan.cooldown_skips)
+                )
+            if not query_jobs:
+                if schedule_plan.next_cooldown_at:
+                    print(f"No country is ready now. Earliest cooldown ends at {schedule_plan.next_cooldown_at} UTC.")
+                else:
+                    print("No unused scheduled queries are available for the selected countries.")
+                if args.execute and schedule_plan.cooldown_skips:
+                    record_cooldown_skips(conn, schedule_plan.cooldown_skips)
+                    conn.commit()
+                return 0
+        else:
+            if args.least_searched_countries:
+                countries = least_searched_countries(conn, countries, args.least_searched_countries)
+            if args.limit_countries is not None:
+                countries = countries[: args.limit_countries]
+            if args.limit_queries is not None:
+                query_specs = limit_query_specs_for_countries(query_specs, countries, args.limit_queries)
+            print(
+                f"Discovery plan: {len(query_specs)} query pattern(s), {len(countries)} country/countries."
+            )
+            if args.least_searched_countries and countries:
+                print("Least-covered countries selected: " + ", ".join(countries))
+            query_jobs = [
+                {
+                    "query": query,
+                    "country": country,
+                    "base_query": query.rsplit(f" {country}", 1)[0] if country else query,
+                    "city": "",
+                    "round_no": 0,
+                    "phase": "manual",
+                }
+                for query, country in build_country_queries(query_specs, countries)
+            ]
         all_rows = []
         failed_queries = []
-        for index, (query, country) in enumerate(queries, 1):
-            print(f"[{index}/{len(queries)}] Searching: {query}")
+        known_websites = {
+            normalize_url(row["website"])
+            for row in conn.execute("SELECT website FROM leads")
+            if normalize_url(row["website"])
+        }
+        run_records = []
+        round_totals = {
+            country: {"queries": 0, "results": 0, "new": 0, "failed": 0}
+            for country in scheduled_by_country
+        }
+        for index, job in enumerate(query_jobs, 1):
+            query = job["query"]
+            country = job["country"]
+            print(f"[{index}/{len(query_jobs)}] Searching: {query}")
             try:
                 rows = discover_websites(settings, query, args.count)
             except Exception as exc:
                 failed_queries.append((query, str(exc)))
                 print(f"  failed: {exc}")
+                run_records.append({**job, "result_count": 0, "unique_count": 0, "new_count": 0, "error": str(exc)})
+                if country in round_totals:
+                    round_totals[country]["queries"] += 1
+                    round_totals[country]["failed"] += 1
                 continue
             for row in rows:
                 row["country"] = country
+            websites = {normalize_url(row.get("website", "")) for row in rows}
+            websites.discard("")
+            new_websites = websites - known_websites
+            known_websites.update(websites)
             all_rows.extend(rows)
             print(f"  found {len(rows)} websites")
+            print(f"  new to this database: {len(new_websites)}")
             for row in rows[:5]:
                 print(f"  - {row['company_name']} -> {row['website']}")
+            run_records.append(
+                {
+                    **job,
+                    "result_count": len(rows),
+                    "unique_count": len(websites),
+                    "new_count": len(new_websites),
+                    "error": "",
+                }
+            )
+            if country in round_totals:
+                round_totals[country]["queries"] += 1
+                round_totals[country]["results"] += len(rows)
+                round_totals[country]["new"] += len(new_websites)
         unique_rows = dedupe_rows(all_rows)
         print_discovery_summary(conn, all_rows, unique_rows)
         if failed_queries:
@@ -528,6 +879,32 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Preview only: {len(unique_rows)} unique websites. Re-run with --execute to import.")
             return 0
         result = import_discovered_rows(conn, unique_rows)
+        for record in run_records:
+            record_discovery_run(
+                conn,
+                country=record["country"],
+                query=record["query"],
+                base_query=record.get("base_query", ""),
+                city=record.get("city", ""),
+                round_no=int(record.get("round_no", 0)),
+                phase=record.get("phase", "manual"),
+                result_count=record["result_count"],
+                unique_count=record["unique_count"],
+                new_count=record["new_count"],
+                error=record["error"],
+            )
+        if schedule_plan:
+            record_cooldown_skips(conn, schedule_plan.cooldown_skips)
+            for country, totals in round_totals.items():
+                record_country_round(
+                    conn,
+                    scheduled_by_country[country],
+                    query_count=totals["queries"],
+                    result_count=totals["results"],
+                    new_count=totals["new"],
+                    failed_count=totals["failed"],
+                )
+        conn.commit()
         print(
             f"Imported {result['processed']} discovered websites "
             f"({result['created']} new, {result['updated']} existing)"
@@ -549,7 +926,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             statuses = ("new", "scrape_failed") if args.retry_failed else ("new",)
             placeholders = ",".join("?" for _ in statuses)
-            order_by = "score DESC, id ASC" if args.retry_failed else "id ASC"
+            order_by = "CASE WHEN status = 'new' THEN 0 ELSE 1 END, id ASC" if args.retry_failed else "id ASC"
             rows = conn.execute(
                 f"""
                 SELECT id, website, emails, phones FROM leads
@@ -755,7 +1132,7 @@ def main(argv: list[str] | None = None) -> int:
             f"SELECT id, website, page_text, emails FROM leads WHERE status IN ({placeholders})",
             statuses,
         ).fetchall()
-        for row in rows:
+        for index, row in enumerate(rows, 1):
             emails = clean_emails_for_website(json.loads(row["emails"] or "[]"), row["website"])
             score, note = score_lead(row["page_text"] or "", emails)
             conn.execute(
@@ -770,6 +1147,8 @@ def main(argv: list[str] | None = None) -> int:
                 """,
                 (score, json.dumps(emails), note, row["id"]),
             )
+            if index % 100 == 0:
+                conn.commit()
         conn.commit()
         print(f"Scored {len(rows)} leads")
         return 0
@@ -935,6 +1314,8 @@ def main(argv: list[str] | None = None) -> int:
                 (row["id"], recipient, subject, body),
             )
             conn.execute("UPDATE leads SET status = 'drafted', updated_at = CURRENT_TIMESTAMP WHERE id = ?", (row["id"],))
+            # Release the write lock before the next potentially slow LLM request.
+            conn.commit()
             made += 1
         conn.commit()
         print(f"Created {made} drafts")
@@ -975,31 +1356,36 @@ def main(argv: list[str] | None = None) -> int:
                     conn.execute("INSERT OR REPLACE INTO llm_cache (cache_key, value) VALUES (?, ?)", (key, opening))
                 except Exception as exc:
                     print(f"LLM skipped for draft {args.draft_id}: {exc}", file=sys.stderr)
+                    return 1
         subject = subject_for(row["company_name"])
         body = draft_body(settings, row["company_name"], opening, settings.mail_reply_to)
-        conn.execute(
+        result = conn.execute(
             """
             UPDATE email_drafts
             SET subject = ?, body = ?, approved = 0
-            WHERE id = ?
+            WHERE id = ? AND sent_at IS NULL
             """,
             (subject, body, args.draft_id),
         )
         conn.commit()
+        if not result.rowcount:
+            print(f"Draft {args.draft_id} was sent before regeneration finished")
+            return 1
         print(f"Regenerated draft {args.draft_id} for {row['recipient']} and marked it pending")
         return 0
 
     if args.cmd == "regenerate-unsent-drafts":
         rows = conn.execute(
             """
-            SELECT d.id AS draft_id, d.recipient,
+            SELECT d.id AS draft_id, d.recipient, d.approved,
                    l.company_name, l.page_text, l.country
             FROM email_drafts d JOIN leads l ON l.id = d.lead_id
             WHERE d.sent_at IS NULL
-            ORDER BY d.id
+            ORDER BY d.approved DESC, d.id DESC
             """
         ).fetchall()
         updated = 0
+        approved_updated = 0
         llm_ok = 0
         llm_failed = 0
         for index, row in enumerate(rows, 1):
@@ -1025,24 +1411,30 @@ def main(argv: list[str] | None = None) -> int:
                     except Exception as exc:
                         llm_failed += 1
                         print(f"LLM skipped for draft {row['draft_id']}: {exc}", file=sys.stderr)
+                        if index % 10 == 0:
+                            conn.commit()
+                            print(f"Processed {index}/{len(rows)} unsent drafts; regenerated {updated} (previously approved: {approved_updated}); LLM failed: {llm_failed}", flush=True)
+                        continue
             subject = subject_for(row["company_name"])
             body = draft_body(settings, row["company_name"], opening, settings.mail_reply_to)
-            conn.execute(
+            result = conn.execute(
                 """
                 UPDATE email_drafts
                 SET subject = ?, body = ?, approved = 0
-                WHERE id = ?
+                WHERE id = ? AND sent_at IS NULL
                 """,
                 (subject, body, row["draft_id"]),
             )
-            updated += 1
+            if result.rowcount:
+                updated += 1
+                approved_updated += int(row["approved"])
             if index % 10 == 0:
                 conn.commit()
-                print(f"Regenerated {index}/{len(rows)} unsent drafts")
+                print(f"Processed {index}/{len(rows)} unsent drafts; regenerated {updated} (previously approved: {approved_updated}); LLM failed: {llm_failed}", flush=True)
         conn.commit()
-        print(f"Regenerated {updated} unsent drafts and marked them pending")
+        print(f"Regenerated {updated} unsent drafts (previously approved: {approved_updated}); marked regenerated drafts pending")
         print(f"LLM ok: {llm_ok}; LLM failed: {llm_failed}")
-        return 0
+        return 1 if llm_failed else 0
 
     if args.cmd == "manual-email-draft":
         email = args.email.lower().strip()
@@ -1367,22 +1759,22 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "send":
         delay = settings.send_delay_seconds if args.delay_seconds is None else args.delay_seconds
-        today_sent = sent_today_count(conn)
-        remaining_quota = remaining_daily_send_quota(conn, settings)
+        today_sent, _ = global_sent_state(settings.db_path)
+        remaining_quota = max(settings.send_daily_limit - today_sent, 0)
         if args.dry_run:
             effective_limit = args.limit
             print(
-                f"DRY RUN only. Daily send status: {today_sent}/{settings.send_daily_limit} sent today, "
+                f"DRY RUN only. Global daily send status: {today_sent}/{settings.send_daily_limit} sent today, "
                 f"{remaining_quota} remaining. Configured delay: {delay:g}s."
             )
         else:
             if remaining_quota <= 0:
-                print(f"Daily send limit reached: {today_sent}/{settings.send_daily_limit} sent today.")
+                print(f"Global daily send limit reached: {today_sent}/{settings.send_daily_limit} sent today across all tasks.")
                 return 0
             effective_limit = min(args.limit, remaining_quota)
             print(
-                f"Daily send status: {today_sent}/{settings.send_daily_limit} sent today, "
-                f"sending up to {effective_limit} more with {delay:g}s between emails."
+                f"Global daily send status: {today_sent}/{settings.send_daily_limit} sent today across all tasks, "
+                f"sending up to {effective_limit} more with a shared {delay:g}s interval."
             )
         candidate_limit = max(effective_limit * 5, effective_limit + 25)
         rows = conn.execute(
@@ -1397,21 +1789,7 @@ def main(argv: list[str] | None = None) -> int:
         sent = 0
         skipped_invalid = 0
         skipped_suppressed = 0
-        waited_before_first_send = False
         for row in rows:
-            if not args.dry_run and delay > 0 and sent == 0 and not waited_before_first_send:
-                waited_before_first_send = True
-                if not wait_before_first_send(conn, delay, continue_after_sleep=args.continue_after_sleep):
-                    print("Stopping send batch because the required pre-send wait interval was interrupted or suspended.", flush=True)
-                    break
-            if (
-                not args.dry_run
-                and not args.continue_after_sleep
-                and sent > 0
-                and wait_gap_was_interrupted(conn, delay)
-            ):
-                print("Stopping send batch before next email because the previous wait interval was interrupted or suspended.", flush=True)
-                break
             recipient = row["recipient"].lower().strip()
             if not is_valid_business_email(recipient):
                 skipped_invalid += 1
@@ -1435,24 +1813,50 @@ def main(argv: list[str] | None = None) -> int:
                 if settings.mail_bcc:
                     print(f"  bcc: {settings.mail_bcc}")
             else:
+                send_slot, slot_message = acquire_send_slot(
+                    settings.db_path,
+                    delay,
+                    settings.send_daily_limit,
+                    continue_after_sleep=args.continue_after_sleep,
+                )
+                if not send_slot:
+                    print(slot_message, flush=True)
+                    break
                 started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 print(f"[{started_at}] Sending draft #{row['id']} to {recipient}", flush=True)
                 try:
                     send_email(settings, recipient, row["subject"], row["body"])
+                    conn.execute("UPDATE email_drafts SET sent_at = CURRENT_TIMESTAMP WHERE id = ?", (row["id"],))
+                    conn.execute(
+                        "UPDATE leads SET status = 'sent', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (row["lead_id"],),
+                    )
+                    conn.commit()
+                except smtplib.SMTPNotSupportedError as exc:
+                    if recipient_needs_smtputf8(recipient, settings):
+                        conn.execute("UPDATE email_drafts SET approved = 0 WHERE id = ?", (row["id"],))
+                        conn.commit()
+                        send_slot.release()
+                        print(
+                            f"Skipping draft #{row['id']}: recipient requires SMTPUTF8, "
+                            "which this SMTP server does not support. Draft preserved and unapproved.",
+                            flush=True,
+                        )
+                        continue
+                    failed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    print(f"[{failed_at}] SMTPUTF8 configuration error for draft #{row['id']}: {exc}", flush=True)
+                    send_slot.release()
+                    break
                 except Exception as exc:
                     failed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     print(
-                        f"[{failed_at}] Send failed for draft #{row['id']} to {recipient}: {exc}",
+                        f"[{failed_at}] Send or local status update failed for draft #{row['id']} to {recipient}: {exc}",
                         flush=True,
                     )
-                    print("Stopping send batch. This draft was not marked as sent and can be retried later.", flush=True)
+                    print("Stopping send batch. Check this draft before retrying.", flush=True)
+                    send_slot.release()
                     break
-                conn.execute("UPDATE email_drafts SET sent_at = CURRENT_TIMESTAMP WHERE id = ?", (row["id"],))
-                conn.execute(
-                    "UPDATE leads SET status = 'sent', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                    (row["lead_id"],),
-                )
-                conn.commit()
+                send_slot.release()
                 finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 print(f"[{finished_at}] Sent draft #{row['id']} to {recipient}", flush=True)
             sent += 1
@@ -1499,21 +1903,31 @@ def main(argv: list[str] | None = None) -> int:
             if settings.mail_bcc:
                 print(f"  bcc: {settings.mail_bcc}")
             return 0
-        today_sent = sent_today_count(conn)
+        today_sent, _ = global_sent_state(settings.db_path)
         if today_sent >= settings.send_daily_limit:
-            print(f"Daily send limit reached: {today_sent}/{settings.send_daily_limit} sent today.")
+            print(f"Global daily send limit reached: {today_sent}/{settings.send_daily_limit} sent today across all tasks.")
+            return 1
+        send_slot, slot_message = acquire_send_slot(
+            settings.db_path,
+            settings.send_delay_seconds,
+            settings.send_daily_limit,
+        )
+        if not send_slot:
+            print(slot_message)
             return 1
         try:
             send_email(settings, recipient, row["subject"], row["body"])
+            conn.execute("UPDATE email_drafts SET sent_at = CURRENT_TIMESTAMP WHERE id = ?", (row["id"],))
+            conn.execute(
+                "UPDATE leads SET status = 'sent', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (row["lead_id"],),
+            )
+            conn.commit()
         except Exception as exc:
-            print(f"Send failed for draft #{row['id']} to {recipient}: {exc}")
+            send_slot.release()
+            print(f"Send or local status update failed for draft #{row['id']} to {recipient}: {exc}")
             return 1
-        conn.execute("UPDATE email_drafts SET sent_at = CURRENT_TIMESTAMP WHERE id = ?", (row["id"],))
-        conn.execute(
-            "UPDATE leads SET status = 'sent', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (row["lead_id"],),
-        )
-        conn.commit()
+        send_slot.release()
         print(f"Sent draft #{row['id']} to {recipient}")
         return 0
 

@@ -27,6 +27,8 @@ EXCLUDES=(
   "--exclude=__pycache__"
   "--exclude=*.pyc"
   "--exclude=.DS_Store"
+  "--exclude=data/dashboard_jobs.json"
+  "--exclude=data/job_logs"
   "--exclude=transfer"
 )
 

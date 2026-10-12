@@ -48,6 +48,16 @@ class Settings:
     google_places_api_key: str
     google_places_region_code: str
     google_places_language_code: str
+    discovery_target_large: int
+    discovery_target_medium: int
+    discovery_target_small: int
+    discovery_target_micro: int
+    discovery_no_new_cooldown_rounds: int
+    discovery_cooldown_hours: float
+    discovery_cities_file: str
+    auto_discovery_interval_seconds: float
+    auto_processing_interval_seconds: float
+    auto_send_idle_seconds: float
     smtp_user: str
     smtp_password: str
 
@@ -84,6 +94,16 @@ def get_settings() -> Settings:
         google_places_api_key=os.getenv("GOOGLE_PLACES_API_KEY", ""),
         google_places_region_code=os.getenv("GOOGLE_PLACES_REGION_CODE", "GB"),
         google_places_language_code=os.getenv("GOOGLE_PLACES_LANGUAGE_CODE", "en"),
+        discovery_target_large=int(os.getenv("DISCOVERY_TARGET_LARGE", "60")),
+        discovery_target_medium=int(os.getenv("DISCOVERY_TARGET_MEDIUM", "40")),
+        discovery_target_small=int(os.getenv("DISCOVERY_TARGET_SMALL", "25")),
+        discovery_target_micro=int(os.getenv("DISCOVERY_TARGET_MICRO", "12")),
+        discovery_no_new_cooldown_rounds=int(os.getenv("DISCOVERY_NO_NEW_COOLDOWN_ROUNDS", "2")),
+        discovery_cooldown_hours=float(os.getenv("DISCOVERY_COOLDOWN_HOURS", "24")),
+        discovery_cities_file=os.getenv("DISCOVERY_CITIES_FILE", ""),
+        auto_discovery_interval_seconds=float(os.getenv("AUTO_DISCOVERY_INTERVAL_SECONDS", "900")),
+        auto_processing_interval_seconds=float(os.getenv("AUTO_PROCESSING_INTERVAL_SECONDS", "60")),
+        auto_send_idle_seconds=float(os.getenv("AUTO_SEND_IDLE_SECONDS", "300")),
         smtp_user=os.getenv("SMTP_USER", ""),
         smtp_password=os.getenv("SMTP_PASSWORD", ""),
     )

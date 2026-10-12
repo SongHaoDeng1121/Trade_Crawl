@@ -49,15 +49,53 @@ CREATE TABLE IF NOT EXISTS llm_cache (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS discovery_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    country TEXT NOT NULL,
+    query TEXT NOT NULL,
+    base_query TEXT,
+    city TEXT,
+    round_no INTEGER NOT NULL DEFAULT 0,
+    phase TEXT NOT NULL DEFAULT 'manual',
+    result_count INTEGER NOT NULL DEFAULT 0,
+    unique_website_count INTEGER NOT NULL DEFAULT 0,
+    new_website_count INTEGER NOT NULL DEFAULT 0,
+    error TEXT,
+    searched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS discovery_country_rounds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    country TEXT NOT NULL,
+    round_no INTEGER NOT NULL,
+    target_count INTEGER NOT NULL,
+    lead_count_before INTEGER NOT NULL DEFAULT 0,
+    query_count INTEGER NOT NULL DEFAULT 0,
+    result_count INTEGER NOT NULL DEFAULT 0,
+    new_website_count INTEGER NOT NULL DEFAULT 0,
+    failed_query_count INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'completed',
+    started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(country, round_no)
+);
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_email_drafts_lead_recipient
 ON email_drafts (lead_id, lower(recipient));
+
+CREATE INDEX IF NOT EXISTS idx_discovery_runs_country_query
+ON discovery_runs (country, query, searched_at);
+
+CREATE INDEX IF NOT EXISTS idx_discovery_country_rounds_country
+ON discovery_country_rounds (country, round_no);
 """
 
 
 def connect(db_path: str) -> sqlite3.Connection:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
 
