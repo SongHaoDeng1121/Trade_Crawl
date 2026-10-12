@@ -11,24 +11,37 @@ import threading
 import time
 import uuid
 from dataclasses import replace
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from .background_jobs import (
+    discover_existing_auto_pipelines,
+    load_job_records,
+    process_is_running,
+    read_log_tail,
+    write_job_records,
+)
 from .config import get_settings
 from .db import connect, init_db
+from .discovery_schedule import country_discovery_status
 from .llm import generate_text
 from .scoring import clean_emails_for_website, is_valid_business_email
+from .send_control import global_sent_state
 from .templates import draft_body, subject_for
 
 
 ROOT = Path(__file__).resolve().parents[1]
 TASKS_FILE = ROOT / "data" / "tasks.json"
 TASK_DIR = ROOT / "data" / "tasks"
+JOBS_FILE = ROOT / "data" / "dashboard_jobs.json"
+JOB_LOG_DIR = ROOT / "data" / "job_logs"
 DEFAULT_TASK_ID = "default"
 DEFAULT_COMMAND_TIMEOUT = 600
 JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()
+STARTING_JOBS: set[tuple[str, str]] = set()
 COMMAND_TIMEOUTS = {
     "crawl_emails": 90000,
     "draft": 90000,
@@ -118,8 +131,8 @@ ALLOWED_COMMANDS: dict[str, list[str]] = {
         "trade_outreach.cli",
         "discover-batch",
         "--limit-queries",
-        "16",
-        "--least-searched-countries",
+        "3",
+        "--scheduled-countries",
         "12",
         "--count",
         "20",
@@ -195,11 +208,15 @@ ALLOWED_COMMANDS: dict[str, list[str]] = {
         "0",
         "--idle-sleep-seconds",
         "300",
+        "--discovery-interval-seconds",
+        "900",
+        "--processing-interval-seconds",
+        "60",
         "--limit-queries",
         "3",
         "--limit-countries",
         "3",
-        "--least-searched-countries",
+        "--scheduled-countries",
         "3",
         "--discover-count",
         "20",
@@ -631,6 +648,8 @@ def delete_task(task_id: str) -> dict:
     tasks = ensure_tasks()
     if task_id == DEFAULT_TASK_ID:
         return {"ok": False, "output": "The default task cannot be deleted."}
+    if get_active_job("auto_pipeline", task_id) or get_active_job("send_real", task_id):
+        return {"ok": False, "output": "Stop this task's running Auto Pipeline or send job before deleting it."}
     next_tasks = [task for task in tasks if task["id"] != task_id]
     if len(next_tasks) == len(tasks):
         return {"ok": False, "output": "Task not found."}
@@ -648,7 +667,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_html(INDEX_HTML)
             return
         if parsed.path == "/api/tasks":
-            self.send_json({"tasks": get_tasks()})
+            self.send_json({"tasks": task_summaries()})
             return
         if parsed.path == "/api/state":
             task = get_task(parse_qs(parsed.query).get("task", [""])[0])
@@ -677,6 +696,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(length) or b"{}")
             self.send_json(delete_task(str(payload.get("task_id", ""))))
+            return
+        if parsed.path == "/api/tasks-auto-start":
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length) or b"{}")
+            self.send_json(start_auto_pipelines(payload.get("task_ids", [])))
+            return
+        if parsed.path == "/api/tasks-auto-stop":
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length) or b"{}")
+            self.send_json(stop_auto_pipelines(payload.get("task_ids", [])))
             return
         if parsed.path == "/api/run":
             length = int(self.headers.get("Content-Length", "0"))
@@ -746,7 +775,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(length) or b"{}")
             draft_id = int(payload.get("draft_id", 0))
-            self.send_json(run_custom(["python3", "-m", "trade_outreach.cli", "send-draft", str(draft_id)], timeout=300, task=get_task(str(payload.get("task_id", "")))))
+            self.send_json(run_custom(["python3", "-m", "trade_outreach.cli", "send-draft", str(draft_id)], timeout=1800, task=get_task(str(payload.get("task_id", "")))))
             return
         if parsed.path == "/api/rescrape-url":
             length = int(self.headers.get("Content-Length", "0"))
@@ -829,6 +858,8 @@ def build_state(task: dict) -> dict:
         "leads_with_emails": conn.execute("SELECT COUNT(*) AS c FROM leads WHERE emails IS NOT NULL AND emails != '[]'").fetchone()["c"],
         "drafts": conn.execute("SELECT COUNT(*) AS c FROM email_drafts").fetchone()["c"],
         "approved": conn.execute("SELECT COUNT(*) AS c FROM email_drafts WHERE approved = 1").fetchone()["c"],
+        "approved_unsent": conn.execute("SELECT COUNT(*) AS c FROM email_drafts WHERE approved = 1 AND sent_at IS NULL").fetchone()["c"],
+        "pending_unsent": conn.execute("SELECT COUNT(*) AS c FROM email_drafts WHERE approved = 0 AND sent_at IS NULL").fetchone()["c"],
         "sent": conn.execute("SELECT COUNT(*) AS c FROM email_drafts WHERE sent_at IS NOT NULL").fetchone()["c"],
         "sent_today": conn.execute(
             """
@@ -840,8 +871,11 @@ def build_state(task: dict) -> dict:
         ).fetchone()["c"],
     }
     stats.update(build_metric_stats(conn))
+    global_sent_today, _ = global_sent_state(settings.db_path)
+    stats["task_sent_today"] = stats["sent_today"]
+    stats["global_sent_today"] = global_sent_today
     stats["daily_limit"] = settings.send_daily_limit
-    stats["remaining_today"] = max(settings.send_daily_limit - stats["sent_today"], 0)
+    stats["remaining_today"] = max(settings.send_daily_limit - global_sent_today, 0)
     stats["by_status"] = [dict(row) for row in conn.execute("SELECT status, COUNT(*) AS count FROM leads GROUP BY status ORDER BY status")]
     leads = [lead_to_dict(row) for row in conn.execute(
         """
@@ -855,6 +889,14 @@ def build_state(task: dict) -> dict:
                l.company_name, l.website, l.score
         FROM email_drafts d JOIN leads l ON l.id = d.lead_id
         ORDER BY d.id DESC LIMIT 200
+        """
+    )]
+    discovery_runs = [dict(row) for row in conn.execute(
+        """
+        SELECT country, query, base_query, city, round_no, phase,
+               result_count, unique_website_count, new_website_count, error, searched_at
+        FROM discovery_runs
+        ORDER BY id DESC LIMIT 200
         """
     )]
     config = {
@@ -877,10 +919,12 @@ def build_state(task: dict) -> dict:
         "send_daily_limit": settings.send_daily_limit,
     }
     country_items = read_list_items(task["countries_file"])
+    country_discovery = country_discovery_status(conn, settings, country_items)
     return {
         "stats": stats,
         "leads": leads,
         "drafts": drafts,
+        "discovery_runs": discovery_runs,
         "config": config,
         "prompt": profile_prompt_context(task) + "\n\n" + read_text("trade_outreach/prompts.py"),
         "template": read_text("trade_outreach/templates.py"),
@@ -890,8 +934,10 @@ def build_state(task: dict) -> dict:
         "country_items": country_items,
         "country_groups": group_countries_by_continent(country_items),
         "country_coverage": build_country_coverage(conn, country_items),
+        "country_discovery": country_discovery,
         "country_presets": {name: len(countries) for name, countries in COUNTRY_PRESETS.items()},
-        "active_auto_pipeline_job": get_active_job("auto_pipeline"),
+        "active_auto_pipeline_job": get_active_job("auto_pipeline", task["id"]),
+        "active_regenerate_job": get_active_job("regenerate_unsent", task["id"]),
     }
 
 
@@ -1426,62 +1472,267 @@ def run_command(command_id: str, task: dict) -> dict:
     command = task_command(command_id, task)
     if not command:
         return {"ok": False, "output": f"Unknown command: {command_id}"}
-    if command_id in {"send_real", "auto_pipeline"}:
+    if command_id in {"send_real", "auto_pipeline", "regenerate_unsent"}:
         return start_background_command(command, task=task, kind=command_id)
     return run_custom(command, timeout=COMMAND_TIMEOUTS.get(command_id, DEFAULT_COMMAND_TIMEOUT), task=task)
 
 
-def start_background_command(command: list[str], task: dict | None = None, kind: str = "background") -> dict:
-    exclusive_kinds = {"send_real", "auto_pipeline"}
+def task_summaries() -> list[dict]:
+    summaries = []
+    for task in get_tasks():
+        summary = json.loads(json.dumps(task, ensure_ascii=False))
+        summary["auto_pipeline_job"] = get_active_job("auto_pipeline", task["id"])
+        summaries.append(summary)
+    return summaries
+
+
+def selected_tasks(task_ids: object) -> list[dict]:
+    if not isinstance(task_ids, list):
+        return []
+    selected_ids = {str(task_id) for task_id in task_ids if str(task_id).strip()}
+    return [task for task in get_tasks() if task["id"] in selected_ids]
+
+
+def start_auto_pipelines(task_ids: object) -> dict:
+    tasks = selected_tasks(task_ids)
+    if not tasks:
+        return {"ok": False, "output": "Select at least one valid task.", "results": []}
+
+    results = []
+    started = 0
+    already_running = 0
+    for task in tasks:
+        existing = get_active_job("auto_pipeline", task["id"])
+        if existing:
+            already_running += 1
+            results.append(
+                {
+                    "task_id": task["id"],
+                    "task_name": task["name"],
+                    "ok": True,
+                    "status": "already_running",
+                    "job_id": existing["job_id"],
+                }
+            )
+            continue
+        result = run_command("auto_pipeline", task)
+        if result.get("ok"):
+            started += 1
+        results.append(
+            {
+                "task_id": task["id"],
+                "task_name": task["name"],
+                "ok": bool(result.get("ok")),
+                "status": "started" if result.get("ok") else "failed",
+                "job_id": result.get("job_id"),
+                "output": result.get("output", ""),
+            }
+        )
+
+    failed = len(tasks) - started - already_running
+    output = (
+        f"Selected {len(tasks)} task(s): started {started}, "
+        f"already running {already_running}, failed {failed}."
+    )
+    return {"ok": failed == 0, "output": output, "results": results}
+
+
+def stop_auto_pipelines(task_ids: object) -> dict:
+    tasks = selected_tasks(task_ids)
+    if not tasks:
+        return {"ok": False, "output": "Select at least one valid task.", "results": []}
+
+    results = []
+    stopped = 0
+    not_running = 0
+    for task in tasks:
+        active = get_active_job("auto_pipeline", task["id"])
+        if not active:
+            not_running += 1
+            results.append(
+                {
+                    "task_id": task["id"],
+                    "task_name": task["name"],
+                    "ok": True,
+                    "status": "not_running",
+                }
+            )
+            continue
+        result = stop_job(active["job_id"])
+        if not result.get("running"):
+            stopped += 1
+        results.append(
+            {
+                "task_id": task["id"],
+                "task_name": task["name"],
+                "ok": bool(result.get("ok")),
+                "status": "stopped" if not result.get("running") else "stopping",
+                "job_id": active["job_id"],
+            }
+        )
+
+    return {
+        "ok": True,
+        "output": f"Selected {len(tasks)} task(s): stopped {stopped}, not running {not_running}.",
+        "results": results,
+    }
+
+
+def persist_jobs_locked() -> None:
+    try:
+        write_job_records(JOBS_FILE, list(JOBS.values()))
+    except OSError as exc:
+        print(f"Could not persist dashboard job registry: {exc}", flush=True)
+
+
+def refresh_jobs() -> None:
+    changed = False
     with JOBS_LOCK:
         for job in JOBS.values():
-            conflicts = job.get("kind") == kind or (kind in exclusive_kinds and job.get("kind") in exclusive_kinds)
+            if not job.get("running"):
+                continue
+            process = job.get("process")
+            if process is not None:
+                returncode = process.poll()
+                alive = returncode is None
+            else:
+                alive = process_is_running(int(job.get("pid", 0) or 0))
+                returncode = job.get("returncode")
+            if not alive:
+                job["running"] = False
+                job["returncode"] = returncode
+                job["ok"] = returncode in {None, 0}
+                changed = True
+        if changed:
+            persist_jobs_locked()
+
+
+def recover_background_jobs() -> None:
+    loaded = load_job_records(JOBS_FILE)
+    tasks = get_tasks()
+    discovered = discover_existing_auto_pipelines(ROOT, tasks)
+    with JOBS_LOCK:
+        JOBS.clear()
+        for record in loaded:
+            job_id = str(record.get("id", "")).strip()
+            if not job_id:
+                continue
+            record["process"] = None
+            record["running"] = bool(record.get("running")) and process_is_running(int(record.get("pid", 0) or 0))
+            JOBS[job_id] = record
+
+        active_keys = {
+            (job.get("task_id"), job.get("kind"))
+            for job in JOBS.values()
+            if job.get("running")
+        }
+        for item in discovered:
+            key = (item["task_id"], "auto_pipeline")
+            if key in active_keys:
+                continue
+            job_id = f"recovered-{item['task_id']}-{item['pid']}"
+            JOBS[job_id] = {
+                "id": job_id,
+                "kind": "auto_pipeline",
+                "task_id": item["task_id"],
+                "task_name": item["task_name"],
+                "command": item["command"],
+                "pid": item["pid"],
+                "pgid": item["pgid"],
+                "log_path": "",
+                "started_at": "",
+                "running": True,
+                "returncode": None,
+                "ok": True,
+                "process": None,
+                "output_note": (
+                    "Recovered an Auto Pipeline that was already running before this Dashboard started. "
+                    "Earlier in-memory output is unavailable; future jobs use persistent log files.\n"
+                ),
+            }
+            active_keys.add(key)
+        persist_jobs_locked()
+
+
+def start_background_command(command: list[str], task: dict | None = None, kind: str = "background") -> dict:
+    refresh_jobs()
+    exclusive_kinds = {"send_real", "auto_pipeline", "regenerate_unsent"}
+    task_id = str(task.get("id", "")) if task else ""
+    task_name = str(task.get("name", "")) if task else ""
+    conflict_group = "real_send" if kind in exclusive_kinds else kind
+    starting_key = (task_id, conflict_group)
+    with JOBS_LOCK:
+        if starting_key in STARTING_JOBS:
+            return {
+                "ok": False,
+                "output": f"A {kind} job is already starting for task {task_name or task_id or '(unassigned)'}."
+            }
+        for job in JOBS.values():
+            same_task = job.get("task_id", "") == task_id
+            conflicts = same_task and (
+                job.get("kind") == kind or (kind in exclusive_kinds and job.get("kind") in exclusive_kinds)
+            )
             if conflicts and job.get("running"):
                 return {
                     "ok": False,
-                    "output": f"A {job.get('kind')} job is already running. Wait for it to finish before starting another.",
+                    "output": (
+                        f"A {job.get('kind')} job is already running for task "
+                        f"{task_name or task_id or '(unassigned)'}. Wait for it to finish before starting another."
+                    ),
                     "job_id": job["id"],
                 }
-    env = os.environ.copy()
-    if task:
-        env.update(task_env(task))
-    try:
-        process = subprocess.Popen(
-            command,
-            cwd=ROOT,
-            env=env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            bufsize=1,
-            start_new_session=True,
-        )
-    except OSError as exc:
-        return {"ok": False, "output": f"Failed to start command: {exc}"}
+        STARTING_JOBS.add(starting_key)
     job_id = str(uuid.uuid4())
+    JOB_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = JOB_LOG_DIR / f"{task_id or 'shared'}-{kind}-{job_id[:8]}.log"
+    try:
+        env = os.environ.copy()
+        if task:
+            env.update(task_env(task))
+        with log_path.open("a", encoding="utf-8") as log_handle:
+            log_handle.write(
+                f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] "
+                f"Starting {kind} for {task_name or task_id or '(unassigned)'}\n"
+            )
+            log_handle.flush()
+            process = subprocess.Popen(
+                command,
+                cwd=ROOT,
+                env=env,
+                text=True,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                bufsize=1,
+                start_new_session=True,
+            )
+    except Exception as exc:
+        with JOBS_LOCK:
+            STARTING_JOBS.discard(starting_key)
+        return {"ok": False, "output": f"Failed to start command: {exc}"}
     job = {
         "id": job_id,
         "kind": kind,
+        "task_id": task_id,
+        "task_name": task_name,
         "command": " ".join(command),
-        "output": f"Started {kind} job {job_id}\n",
+        "pid": process.pid,
+        "pgid": process.pid,
+        "log_path": str(log_path),
+        "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "output_note": f"Started {kind} job {job_id} for task {task_name or task_id or '(unassigned)'}.\n",
         "running": True,
         "returncode": None,
         "process": process,
     }
     with JOBS_LOCK:
+        STARTING_JOBS.discard(starting_key)
         JOBS[job_id] = job
-    threading.Thread(target=collect_job_output, args=(job_id, process), daemon=True).start()
-    return {"ok": True, "output": job["output"], "job_id": job_id, "running": True}
+        persist_jobs_locked()
+    threading.Thread(target=monitor_background_job, args=(job_id, process), daemon=True).start()
+    return {"ok": True, "output": job["output_note"], "job_id": job_id, "running": True}
 
 
-def collect_job_output(job_id: str, process: subprocess.Popen) -> None:
-    if process.stdout:
-        for line in process.stdout:
-            with JOBS_LOCK:
-                job = JOBS.get(job_id)
-                if not job:
-                    continue
-                job["output"] += line
+def monitor_background_job(job_id: str, process: subprocess.Popen) -> None:
     returncode = process.wait()
     with JOBS_LOCK:
         job = JOBS.get(job_id)
@@ -1491,7 +1742,14 @@ def collect_job_output(job_id: str, process: subprocess.Popen) -> None:
             job["ok"] = returncode == 0
             kind = job.get("kind", "background")
             job["process"] = None
-            job["output"] += f"\n{kind} job finished with exit code {returncode}.\n"
+            log_path = job.get("log_path", "")
+            if log_path:
+                try:
+                    with Path(log_path).open("a", encoding="utf-8") as handle:
+                        handle.write(f"\n{kind} job finished with exit code {returncode}.\n")
+                except OSError:
+                    pass
+            persist_jobs_locked()
 
 
 def stop_job(job_id: str) -> dict:
@@ -1502,55 +1760,89 @@ def stop_job(job_id: str) -> dict:
         if not job:
             return {"ok": False, "output": "Job not found.", "running": False}
         process = job.get("process")
-        if not job.get("running") or process is None:
-            return {"ok": True, "output": job.get("output", "") + "\nJob is not running.\n", "running": False}
-        job["output"] += "\nStop requested from dashboard. Terminating background job...\n"
+        pid = int(job.get("pid", 0) or 0)
+        pgid = int(job.get("pgid", 0) or pid)
+        if not job.get("running") or not process_is_running(pid):
+            job["running"] = False
+            persist_jobs_locked()
+            return {"ok": True, "output": get_job_output(job) + "\nJob is not running.\n", "running": False}
+        job["output_note"] = job.get("output_note", "") + "\nStop requested from dashboard.\n"
+        persist_jobs_locked()
     try:
-        os.killpg(process.pid, signal.SIGTERM)
+        os.killpg(pgid, signal.SIGTERM)
     except ProcessLookupError:
         pass
     except Exception as exc:
         with JOBS_LOCK:
             job = JOBS.get(job_id)
             if job:
-                job["output"] += f"Stop request failed: {exc}\n"
+                job["output_note"] = job.get("output_note", "") + f"Stop request failed: {exc}\n"
+                persist_jobs_locked()
         return get_job(job_id)
 
     deadline = time.time() + 5
     while time.time() < deadline:
-        if process.poll() is not None:
+        if process is not None:
+            stopped = process.poll() is not None
+        else:
+            stopped = not process_is_running(pid)
+        if stopped:
+            with JOBS_LOCK:
+                job = JOBS.get(job_id)
+                if job:
+                    job["running"] = False
+                    persist_jobs_locked()
             return get_job(job_id)
         time.sleep(0.2)
     try:
-        os.killpg(process.pid, signal.SIGKILL)
+        os.killpg(pgid, signal.SIGKILL)
         with JOBS_LOCK:
             job = JOBS.get(job_id)
             if job:
-                job["output"] += "Background job did not stop quickly; force killed it.\n"
+                job["running"] = False
+                job["output_note"] = job.get("output_note", "") + "Background job did not stop quickly; force killed it.\n"
+                persist_jobs_locked()
     except ProcessLookupError:
         pass
     return get_job(job_id)
 
 
+def get_job_output(job: dict) -> str:
+    note = str(job.get("output_note", ""))
+    log = read_log_tail(str(job.get("log_path", "")))
+    return (note + log).strip() or "(no output available)"
+
+
 def get_job(job_id: str) -> dict:
+    refresh_jobs()
     with JOBS_LOCK:
         job = JOBS.get(job_id)
         if not job:
             return {"ok": False, "output": "Job not found.", "running": False}
         return {
             "ok": job.get("ok", True),
-            "output": job.get("output", ""),
+            "output": get_job_output(job),
             "running": bool(job.get("running")),
             "returncode": job.get("returncode"),
             "job_id": job_id,
         }
 
 
-def get_active_job(kind: str) -> dict | None:
+def get_active_job(kind: str, task_id: str | None = None) -> dict | None:
+    refresh_jobs()
     with JOBS_LOCK:
         for job_id, job in JOBS.items():
-            if job.get("kind") == kind and job.get("running"):
-                return {"job_id": job_id, "kind": kind, "running": True}
+            matches_task = task_id is None or job.get("task_id") == task_id
+            if job.get("kind") == kind and matches_task and job.get("running"):
+                return {
+                    "job_id": job_id,
+                    "kind": kind,
+                    "task_id": job.get("task_id", ""),
+                    "task_name": job.get("task_name", ""),
+                    "pid": job.get("pid"),
+                    "started_at": job.get("started_at", ""),
+                    "running": True,
+                }
     return None
 
 
@@ -1574,6 +1866,7 @@ def run_custom(command: list[str], timeout: int = DEFAULT_COMMAND_TIMEOUT, task:
 
 
 def run(host: str = "127.0.0.1", port: int = 8765) -> None:
+    recover_background_jobs()
     server = ThreadingHTTPServer((host, port), DashboardHandler)
     print(f"Dashboard running at http://{host}:{port}")
     server.serve_forever()
@@ -1592,13 +1885,17 @@ TASKS_HTML = r"""<!doctype html>
     main { max-width: 980px; margin: 0 auto; padding: 18px; display: grid; gap: 14px; }
     section, .task { background: #fff; border: 1px solid #d9e0e4; border-radius: 8px; }
     section { padding: 14px; }
-    .task { padding: 12px; display:grid; grid-template-columns: minmax(0,1fr) auto auto; gap:8px; align-items:center; }
+    .task { padding: 12px; display:grid; grid-template-columns: auto minmax(0,1fr) auto auto; gap:8px; align-items:center; }
     input { height: 36px; border: 1px solid #d9e0e4; border-radius: 6px; padding: 0 10px; font: inherit; }
+    input.task-select { width: 18px; height: 18px; }
     button, a.button { height: 36px; border: 1px solid #d9e0e4; background:#eef4f6; border-radius:6px; padding:0 12px; font-weight:700; cursor:pointer; color:#1d2428; text-decoration:none; display:inline-flex; align-items:center; }
     .primary { background:#256f8f !important; border-color:#256f8f !important; color:white !important; }
     .danger { color:#a33a2f; border-color:#d8aaa6; background:#fff4f3; }
     .row { display:flex; gap:8px; flex-wrap:wrap; }
     .muted { color:#60717b; font-size:12px; }
+    .status { display:inline-flex; margin-top:6px; border-radius:999px; padding:3px 8px; background:#e8eef1; color:#60717b; font-size:12px; font-weight:700; }
+    .status.running { background:#e2f3e8; color:#237a4b; }
+    #multiOutput { margin-top:10px; min-height:18px; }
   </style>
 </head>
 <body>
@@ -1610,10 +1907,22 @@ TASKS_HTML = r"""<!doctype html>
         <button class="primary" onclick="createTask()">Create Task</button>
       </div>
     </section>
+    <section>
+      <div><b>Run multiple tasks together</b></div>
+      <div class="muted" style="margin:6px 0 10px">Select steel pipe, valve, or any future tasks. Each selected task runs in its own process and keeps its own database.</div>
+      <div class="row">
+        <button onclick="selectAllTasks(true)">Select All</button>
+        <button onclick="selectAllTasks(false)">Clear</button>
+        <button class="primary" onclick="startSelectedTasks()">Start Selected Together</button>
+        <button class="danger" onclick="stopSelectedTasks()">Stop Selected</button>
+      </div>
+      <div id="multiOutput" class="muted">No action yet.</div>
+    </section>
     <div id="tasks"></div>
   </main>
   <script>
     let tasks = [];
+    const selectedTaskIds = new Set();
     async function refresh() {
       const res = await fetch('/api/tasks');
       const data = await res.json();
@@ -1623,17 +1932,71 @@ TASKS_HTML = r"""<!doctype html>
     function render() {
       document.getElementById('tasks').innerHTML = tasks.map(t => `
         <div class="task">
+          <input class="task-select" type="checkbox" aria-label="Select ${escapeAttr(t.name)}" ${selectedTaskIds.has(t.id) ? 'checked' : ''} onchange="toggleTask('${t.id}', this.checked)">
           <div>
             <input id="name-${t.id}" value="${escapeAttr(t.name)}">
             <div class="muted">${escapeHtml(t.id)} | ${escapeHtml(t.db_path)}</div>
+            <span class="status ${t.auto_pipeline_job && t.auto_pipeline_job.running ? 'running' : ''}">${t.auto_pipeline_job && t.auto_pipeline_job.running ? 'Auto Pipeline running' : 'Idle'}</span>
           </div>
           <a class="button primary" href="/dashboard?task=${encodeURIComponent(t.id)}">Open Dashboard</a>
           <div class="row">
+            ${t.auto_pipeline_job && t.auto_pipeline_job.running
+              ? `<button class="danger" onclick="stopTasks(['${t.id}'])">Stop</button>`
+              : `<button onclick="startTasks(['${t.id}'])">Start</button>`}
             <button onclick="renameTask('${t.id}')">Rename</button>
             <button class="danger" onclick="deleteTask('${t.id}')">Delete</button>
           </div>
         </div>
       `).join('');
+    }
+    function toggleTask(id, checked) {
+      if (checked) selectedTaskIds.add(id);
+      else selectedTaskIds.delete(id);
+    }
+    function selectAllTasks(checked) {
+      selectedTaskIds.clear();
+      if (checked) tasks.forEach(t => selectedTaskIds.add(t.id));
+      render();
+    }
+    async function startSelectedTasks() {
+      await startTasks([...selectedTaskIds]);
+    }
+    async function stopSelectedTasks() {
+      await stopTasks([...selectedTaskIds]);
+    }
+    async function startTasks(taskIds) {
+      if (!taskIds.length) {
+        document.getElementById('multiOutput').textContent = 'Select at least one task first.';
+        return;
+      }
+      const names = tasks.filter(t => taskIds.includes(t.id)).map(t => t.name).join(', ');
+      if (!confirm(`Start Auto Pipeline concurrently for: ${names}? Auto approval and real SMTP sending are enabled by the existing Auto Pipeline settings.`)) return;
+      document.getElementById('multiOutput').textContent = 'Starting selected tasks...';
+      const res = await fetch('/api/tasks-auto-start', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({task_ids:taskIds})
+      });
+      const data = await res.json();
+      document.getElementById('multiOutput').textContent = data.output || 'Start request completed.';
+      await refresh();
+    }
+    async function stopTasks(taskIds) {
+      if (!taskIds.length) {
+        document.getElementById('multiOutput').textContent = 'Select at least one task first.';
+        return;
+      }
+      const names = tasks.filter(t => taskIds.includes(t.id)).map(t => t.name).join(', ');
+      if (!confirm(`Stop Auto Pipeline for: ${names}?`)) return;
+      document.getElementById('multiOutput').textContent = 'Stopping selected tasks...';
+      const res = await fetch('/api/tasks-auto-stop', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({task_ids:taskIds})
+      });
+      const data = await res.json();
+      document.getElementById('multiOutput').textContent = data.output || 'Stop request completed.';
+      await refresh();
     }
     async function createTask() {
       const name = document.getElementById('newTaskName').value.trim();
@@ -1655,6 +2018,7 @@ TASKS_HTML = r"""<!doctype html>
     function escapeHtml(value) { return String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch])); }
     function escapeAttr(value) { return escapeHtml(value); }
     refresh();
+    setInterval(refresh, 5000);
   </script>
 </body>
 </html>
@@ -1859,6 +2223,7 @@ INDEX_HTML = r"""<!doctype html>
         <button onclick="runCmd('score')">Score / Rescore</button>
         <button onclick="runCmd('draft')">Generate All Missing Drafts</button>
         <button onclick="runCmd('regenerate_unsent')">Regenerate Unsent Drafts</button>
+        <button id="stopRegenerateBtn" class="danger" onclick="stopRegeneration()" disabled>Stop Draft Regeneration</button>
         <button onclick="runCmd('export')">Export CSV</button>
         <button onclick="runCmd('export_leads')">Export Leads CSV</button>
         <input id="importLeadsPath" placeholder="CSV path to import leads">
@@ -1895,6 +2260,10 @@ INDEX_HTML = r"""<!doctype html>
         <pre class="output" id="output">(idle)</pre>
       </section>
       <section>
+        <h2>Discovery History</h2>
+        <div class="table-wrap"><table id="discoveryTable"></table></div>
+      </section>
+      <section>
         <h2>Leads</h2>
         <div class="table-wrap"><table id="leadsTable"></table></div>
       </section>
@@ -1916,6 +2285,7 @@ INDEX_HTML = r"""<!doctype html>
     let state = null;
     let currentJobId = null;
     let currentAutoPipelineJobId = null;
+    let currentRegenerateJobId = null;
     const taskId = new URLSearchParams(location.search).get('task') || 'default';
     async function refresh() {
       const res = await fetch(`/api/state?task=${encodeURIComponent(taskId)}`);
@@ -1924,7 +2294,9 @@ INDEX_HTML = r"""<!doctype html>
     }
     function render() {
       const activeAutoJob = state.active_auto_pipeline_job;
-      currentAutoPipelineJobId = activeAutoJob && activeAutoJob.running ? activeAutoJob.job_id : currentAutoPipelineJobId;
+      currentAutoPipelineJobId = activeAutoJob && activeAutoJob.running ? activeAutoJob.job_id : null;
+      const activeRegenerateJob = state.active_regenerate_job;
+      currentRegenerateJobId = activeRegenerateJob && activeRegenerateJob.running ? activeRegenerateJob.job_id : null;
       updateStopButton();
       const c = state.config;
       document.getElementById('taskName').textContent = c.task_name || 'B2B Outreach Dashboard';
@@ -1934,8 +2306,10 @@ INDEX_HTML = r"""<!doctype html>
         stat('Companies', s.total_leads),
         stat('Companies With Email', s.leads_with_valid_email),
         stat('Drafts', s.drafts),
+        stat('Approved Unsent', s.approved_unsent),
+        stat('Pending Review', s.pending_unsent),
         stat('Sent', s.sent),
-        stat('Today Send Left', s.remaining_today),
+        stat('Global Send Left Today', s.remaining_today, `${s.global_sent_today || 0}/${s.daily_limit || 0} sent across all tasks`),
       ].join('');
       document.getElementById('diagnosticStats').innerHTML = [
         stat('Email Crawl Success', `${s.email_crawl_rate}%`),
@@ -1943,6 +2317,7 @@ INDEX_HTML = r"""<!doctype html>
       ].join('');
       renderLeads();
       renderDrafts();
+      renderDiscoveryRuns();
       document.getElementById('prompt').textContent = state.prompt;
       document.getElementById('template').textContent = state.template;
       renderListEditor('queries', state.query_items || []);
@@ -1988,11 +2363,17 @@ INDEX_HTML = r"""<!doctype html>
         <div class="list-group-title">${escapeHtml(group.continent)} (${(group.countries || []).length})</div>
         ${(group.countries || []).map(item => `
           <div class="list-row">
-            <div class="list-value">${escapeHtml(item)} <span class="muted">leads: ${Number((state.country_coverage || {})[item] || 0)}</span></div>
+            <div class="list-value">${countryStatusHtml(item)}</div>
             <button onclick='deleteListItem("countries", ${JSON.stringify(item)})'>Delete</button>
           </div>
         `).join('')}
       `).join('');
+    }
+    function countryStatusHtml(country) {
+      const item = (state.country_discovery || {})[country] || {};
+      const cooldown = item.cooldown_active ? ` · cooling until ${item.cooldown_until || '-'}` : '';
+      const last = item.last_searched_at ? ` · last ${item.last_searched_at}` : ' · not searched by the new scheduler yet';
+      return `${escapeHtml(country)} <span class="muted">leads ${Number(item.lead_count || 0)}/${Number(item.target_count || 0)} · ${escapeHtml(item.tier || '-')} · round ${Number(item.rounds_completed || 0)} · no-new ${Number(item.no_new_rounds || 0)}${escapeHtml(cooldown)}${escapeHtml(last)}</span>`;
     }
     function renderCountryPresetImporter() {
       const presets = state.country_presets || {};
@@ -2057,6 +2438,22 @@ INDEX_HTML = r"""<!doctype html>
         <thead><tr><th>ID</th><th>Recipient</th><th>Score</th><th>Status</th><th>Draft</th><th>Actions</th></tr></thead>
         <tbody>${rows || '<tr><td colspan="6">No drafts yet</td></tr>'}</tbody>`;
     }
+    function renderDiscoveryRuns() {
+      const rows = (state.discovery_runs || []).map(item => `
+        <tr>
+          <td>${escapeHtml(item.searched_at || '')}</td>
+          <td>${escapeHtml(item.country || '')}</td>
+          <td>R${Number(item.round_no || 0)} ${escapeHtml(item.phase || '')}</td>
+          <td>${escapeHtml(item.query || '')}</td>
+          <td>${Number(item.result_count || 0)}</td>
+          <td>${Number(item.new_website_count || 0)}</td>
+          <td>${escapeHtml(item.error || '')}</td>
+        </tr>
+      `).join('');
+      document.getElementById('discoveryTable').innerHTML = `
+        <thead><tr><th>Last Search</th><th>Country</th><th>Round</th><th>Query</th><th>Results</th><th>New</th><th>Error</th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="7">No recorded executed discovery searches yet</td></tr>'}</tbody>`;
+    }
     function draftStatus(d) {
       if (d.sent_at) {
         return `<span class="pill sent">sent</span><br><span class="muted">${escapeHtml(d.sent_at)}</span>`;
@@ -2078,7 +2475,7 @@ INDEX_HTML = r"""<!doctype html>
       `;
     }
     async function runCmd(command) {
-      if (command === 'discover_agent_targets' && !confirm('Explore target customers from the current query list in the least-covered current countries? This may use more Google Places requests.')) return;
+      if (command === 'discover_agent_targets' && !confirm('Run the fair discovery scheduler for the next countries in the current round? Expansion rounds use unused keywords, local-language queries, and major cities. This may use more Google Places requests.')) return;
       if (command === 'regenerate_unsent' && !confirm('Regenerate all unsent drafts now? Already sent emails will not be changed. Regenerated drafts will be marked pending for review.')) return;
       if (command === 'approve_execute' && !confirm('Approve the preview batch of drafts?')) return;
       if (command === 'send_real' && !confirm('Really send up to 100 approved unsent emails now? The interval is 800 seconds per email. If the computer sleeps or the process is suspended, this batch will stop instead of continuing late.')) return;
@@ -2087,9 +2484,10 @@ INDEX_HTML = r"""<!doctype html>
       const res = await fetch('/api/run', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({command, task_id: taskId})});
       const data = await res.json();
       document.getElementById('output').textContent = data.output;
-      if (data.job_id) {
+      if (data.ok && data.job_id) {
         currentJobId = data.job_id;
         if (command === 'auto_pipeline') currentAutoPipelineJobId = data.job_id;
+        if (command === 'regenerate_unsent') currentRegenerateJobId = data.job_id;
         updateStopButton();
         await pollJob(data.job_id);
         return;
@@ -2111,6 +2509,7 @@ INDEX_HTML = r"""<!doctype html>
       }
       if (jobId === currentJobId) currentJobId = null;
       if (jobId === currentAutoPipelineJobId) currentAutoPipelineJobId = null;
+      if (jobId === currentRegenerateJobId) currentRegenerateJobId = null;
       setBusy(false);
       updateStopButton();
       await refresh();
@@ -2130,6 +2529,24 @@ INDEX_HTML = r"""<!doctype html>
         currentAutoPipelineJobId = null;
         setBusy(false);
         updateStopButton();
+        await refresh();
+      }
+    }
+    async function stopRegeneration() {
+      if (!currentRegenerateJobId) return;
+      if (!confirm('Stop draft regeneration after the current request? Drafts already regenerated will remain pending for review.')) return;
+      const jobId = currentRegenerateJobId;
+      const res = await fetch('/api/job-stop', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({job_id: jobId})
+      });
+      const data = await res.json();
+      document.getElementById('output').textContent = data.output;
+      if (!data.running) {
+        if (jobId === currentJobId) currentJobId = null;
+        currentRegenerateJobId = null;
+        setBusy(false);
         await refresh();
       }
     }
@@ -2332,12 +2749,21 @@ INDEX_HTML = r"""<!doctype html>
     function updateStopButton() {
       const btn = document.getElementById('stopAutoPipelineBtn');
       if (btn) btn.disabled = !currentAutoPipelineJobId;
+      const regenerateBtn = document.getElementById('stopRegenerateBtn');
+      if (regenerateBtn) regenerateBtn.disabled = !currentRegenerateJobId;
     }
     function escapeHtml(value) {
       return String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
     }
     function escapeAttr(value) { return escapeHtml(value); }
-    refresh();
+    refresh().then(() => {
+      const job = state.active_regenerate_job;
+      if (job && job.running) {
+        currentJobId = job.job_id;
+        setBusy(true);
+        pollJob(job.job_id);
+      }
+    });
   </script>
 </body>
 </html>
